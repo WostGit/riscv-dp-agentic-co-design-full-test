@@ -1,6 +1,6 @@
 name: Ultra-Verbos RISC-V + Differential Privacy Agentic Co-Design Full Test Matrix
 
-# Triggers: push/PR to relevant paths, or manual dispatch with parameters
+# Triggers
 on:
   push:
     branches: [ main, develop ]
@@ -24,21 +24,22 @@ on:
         required: false
         default: 'all'
 
-# Environment variables used across jobs
+# Global environment variables
 env:
   PYTHON_VERSION: "3.12"
   VERILATOR_VERSION: "5.030"
-  YOSYS_VERSION: "0.47"  # Available via apt on ubuntu-24.04
+  YOSYS_VERSION: "0.47"
   RISCV_TOOLCHAIN_VERSION: "2024.09.10"
   DP_MODULE_NAME: "dp_noise_injector"
-  MAX_JOB_TIMEOUT_MINUTES: 360  # Safety net
 
+# === FIXED PERMISSIONS ===
+# 'artifacts: write' is invalid and was causing the error.
+# Artifact upload/download is controlled by 'contents: write'
 permissions:
-  contents: read
-  actions: read
-  checks: write
-  pull-requests: write
-  artifacts: write
+  contents: write          # Required for checkout + actions/upload-artifact & download-artifact
+  checks: write            # For status checks and annotations
+  pull-requests: write     # For adding comments to PRs in the summary job
+  actions: read            # Safe default for workflow introspection
 
 jobs:
 
@@ -63,7 +64,7 @@ jobs:
       - name: 📦 Install Python dependencies (for agents, analysis, reporting)
         run: |
           python -m pip install --upgrade pip
-          pip install rich matplotlib numpy pandas scipy huggingface_hub transformers langchain langgraph  # For agent orchestration
+          pip install rich matplotlib numpy pandas scipy huggingface_hub transformers
 
       - name: 🛠️ Cache Verilator build
         uses: actions/cache@v4
@@ -83,7 +84,7 @@ jobs:
           make -j$(nproc) && make install
           echo "$HOME/verilator/install/bin" >> $GITHUB_PATH
 
-      - name: 📥 Install open-source EDA tools (Yosys, Icarus, GTKWave)
+      - name: 📥 Install open-source EDA tools (Yosys, Icarus Verilog, GTKWave)
         run: |
           sudo apt-get install -y yosys iverilog gtkwave
 
@@ -92,21 +93,13 @@ jobs:
         with:
           riscv-gnu-toolchain-version: ${{ env.RISCV_TOOLCHAIN_VERSION }}
 
-      - name: 📦 Cache pip packages and tool outputs
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/pip
-            ~/riscv-tools
-          key: ${{ runner.os }}-tools-${{ hashFiles('**/requirements*.txt') }}
-
       - name: ✅ Setup complete - print environment summary
         run: |
           echo "=== Environment Summary ==="
           echo "Python: $(python --version)"
           echo "Verilator: $(verilator --version 2>&1 | head -1 || echo 'not in PATH yet')"
           echo "Yosys: $(yosys --version 2>&1 | head -1)"
-          echo "RISC-V GCC: $(riscv64-unknown-elf-gcc --version | head -1)"
+          echo "RISC-V GCC: $(riscv64-unknown-elf-gcc --version | head -1 || echo 'not installed')"
 
   # =============================================
   # 2. AGENTIC RTL GENERATION MATRIX
@@ -121,23 +114,12 @@ jobs:
         core: [picorv32, vexriscv, neorv32]
         noise: [laplace, gaussian, hybrid]
         backend: [python, rtlcoder_mistral, rtlcoder_deepseek, verilogcoder]
-        include:
-          - backend: python
-            description: "Lightweight rule/template-based agent (fast baseline)"
-          - backend: rtlcoder_mistral
-            description: "RTLCoder-v1.1 (Mistral-based, HF)"
-            model_id: "ishorn5/RTLCoder-v1.1"
-          - backend: rtlcoder_deepseek
-            description: "RTLCoder-Deepseek-v1.1 (best performance on VerilogEval)"
-            model_id: "ishorn5/RTLCoder-Deepseek-v1.1"
-          - backend: verilogcoder
-            description: "NVIDIA VerilogCoder multi-agent (graph planning + AST tracing)"
 
     steps:
       - name: 📋 Checkout code
         uses: actions/checkout@v4
 
-      - name: 🔄 Restore cached tools
+      - name: 🔄 Restore cached Verilator
         uses: actions/cache/restore@v4
         with:
           path: ~/verilator
@@ -146,27 +128,24 @@ jobs:
 
       - name: 🚀 Run Agentic Co-Design for ${{ matrix.core }} + ${{ matrix.noise }} using ${{ matrix.backend }}
         id: generation
-        env:
-          HF_TOKEN: ${{ secrets.HUGGINGFACE_TOKEN }}  # Optional for gated models
         run: |
           echo "=== Starting Agentic Generation ==="
-          echo "Core          : ${{ matrix.core }}"
+          echo "Core           : ${{ matrix.core }}"
           echo "Noise mechanism: ${{ matrix.noise }}"
-          echo "Backend       : ${{ matrix.backend }}"
-          echo "Model (if applicable): ${{ matrix.model_id || 'N/A' }}"
+          echo "Backend        : ${{ matrix.backend }}"
 
           python scripts/agentic_generator.py \
             --core ${{ matrix.core }} \
             --noise ${{ matrix.noise }} \
             --backend ${{ matrix.backend }} \
-            --model ${{ matrix.model_id || '' }} \
             --epsilon 1.0 \
             --output-dir rtl/generated/${{ matrix.core }}_${{ matrix.noise }}_${{ matrix.backend }} \
             --verbose
 
-          # Always generate a fallback simple module if agent fails
+          # Fallback to simple module if agent generation fails
           if [ ! -f "rtl/generated/${{ matrix.core }}_${{ matrix.noise }}_${{ matrix.backend }}/dp_noise_injector.v" ]; then
-            echo "⚠️ Agent failed - using fallback simple DP module"
+            echo "⚠️ Agent failed - using fallback DP noise injector"
+            mkdir -p rtl/generated/${{ matrix.core }}_${{ matrix.noise }}_${{ matrix.backend }}
             cp dp_noise/fallback_dp_noise_injector.v rtl/generated/${{ matrix.core }}_${{ matrix.noise }}_${{ matrix.backend }}/
           fi
 
@@ -176,7 +155,7 @@ jobs:
           name: generated-rtl-${{ matrix.core }}-${{ matrix.noise }}-${{ matrix.backend }}
           path: |
             rtl/generated/${{ matrix.core }}_${{ matrix.noise }}_${{ matrix.backend }}/**
-            logs/agent_${{ matrix.core }}_${{ matrix.noise }}_${{ matrix.backend }}.log
+            logs/agent_*.log
           retention-days: 14
 
   # =============================================
@@ -232,11 +211,10 @@ jobs:
             sim/**/waveform_*.vcd
             sim_output.log
             report_*.md
-            test_results.json
           retention-days: 14
 
   # =============================================
-  # 4. SYNTHESIS ESTIMATES
+  # 4. SYNTHESIS ESTIMATES (Yosys)
   # =============================================
   synthesis-estimates:
     needs: simulation-verification
@@ -296,7 +274,6 @@ jobs:
             --artifacts-dir all-artifacts \
             --output SUMMARY_FULL.md \
             --include-failures
-
           cat SUMMARY_FULL.md
 
       - name: 📤 Upload final report
@@ -312,10 +289,5 @@ jobs:
           message: |
             🎉 **RISC-V + DP Agentic Co-Design Full Matrix Test Completed!**
 
-            Tested combinations:
-            - Cores: PicoRV32, VexRiscv, NEORV32
-            - Noise: Laplace, Gaussian, Hybrid
-            - Backends: Python baseline, RTLCoder (2 variants), VerilogCoder
-
-            Check the `full-demo-summary` artifact for pass/fail rates, noise quality, area estimates, and waveforms.
-            This demonstrates the current state of **open** agentic hardware co-design in CI.
+            Tested combinations include multiple cores, noise mechanisms, and open agentic backends.
+            Check the `full-demo-summary` artifact for detailed results, waveforms, and synthesis stats.
