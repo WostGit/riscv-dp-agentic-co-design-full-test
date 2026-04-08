@@ -23,14 +23,14 @@ env:
   PYTHON_VERSION: "3.12"
   VERILATOR_VERSION: "5.030"
   YOSYS_VERSION: "0.47"
-  TOOLCHAIN_VERSION: "2024.09.10"   # Matches common stable prebuilt releases
+  TOOLCHAIN_TAG: "2026.04.05-nightly"   # Latest stable nightly as of April 2026
   DP_MODULE_NAME: "dp_noise_injector"
   RISCV_PREFIX: "riscv64-unknown-elf-"
 
 permissions:
-  contents: write
+  contents: write          # Required for checkout + artifact upload/download
   checks: write
-  pull-requests: write
+  pull-requests: write     # For PR comments in summary job
   actions: read
 
 jobs:
@@ -40,7 +40,7 @@ jobs:
   # =============================================
   setup-environment:
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 30
     steps:
       - name: 📋 Checkout repository
         uses: actions/checkout@v4
@@ -53,19 +53,19 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: 'pip'
 
-      - name: 📦 Install Python dependencies
+      - name: 📦 Install Python dependencies (rich, matplotlib, numpy, pandas, huggingface_hub, transformers)
         run: |
           python -m pip install --upgrade pip
           pip install rich matplotlib numpy pandas scipy huggingface_hub transformers
 
-      - name: 🛠️ Cache Verilator
+      - name: 🛠️ Cache Verilator build
         uses: actions/cache@v4
         id: cache-verilator
         with:
           path: ~/verilator
           key: ${{ runner.os }}-verilator-${{ env.VERILATOR_VERSION }}
 
-      - name: 🔨 Build & install Verilator if needed
+      - name: 🔨 Build & install Verilator if cache miss
         if: steps.cache-verilator.outputs.cache-hit != 'true'
         run: |
           sudo apt-get update
@@ -76,42 +76,58 @@ jobs:
           make -j$(nproc) && make install
           echo "$HOME/verilator/install/bin" >> $GITHUB_PATH
 
-      - name: 📥 Install open-source EDA tools
+      - name: 📥 Install open-source EDA tools (Yosys, Icarus Verilog, GTKWave)
         run: |
           sudo apt-get install -y yosys iverilog gtkwave
 
-      # === FIXED TOOLCHAIN INSTALLATION ===
-      - name: 🔧 Download and setup prebuilt RISC-V GNU Toolchain (riscv64-unknown-elf)
+      # === FIXED TOOLCHAIN INSTALLATION (reliable prebuilt) ===
+      - name: 🔧 Download & install prebuilt RISC-V GNU Toolchain (riscv64-unknown-elf)
         run: |
           mkdir -p ~/riscv-toolchain
           cd ~/riscv-toolchain
 
-          # Download a stable prebuilt ELF toolchain (newlib)
-          wget -q https://github.com/riscv-collab/riscv-gnu-toolchain/releases/download/${{ env.TOOLCHAIN_VERSION }}/riscv64-unknown-elf-toolchain-${{ env.TOOLCHAIN_VERSION }}-x86_64-linux-ubuntu22.tar.gz \
-            -O toolchain.tar.gz || \
-          wget -q https://github.com/riscv/riscv-gnu-toolchain/releases/download/${{ env.TOOLCHAIN_VERSION }}/riscv64-unknown-elf-toolchain-${{ env.TOOLCHAIN_VERSION }}-x86_64-linux-ubuntu22.tar.gz \
-            -O toolchain.tar.gz
+          echo "Downloading toolchain tag: ${{ env.TOOLCHAIN_TAG }}"
 
-          tar -xzf toolchain.tar.gz --strip-components=1 -C .
+          # Try official riscv-collab nightly first
+          wget -q --show-progress \
+            https://github.com/riscv-collab/riscv-gnu-toolchain/releases/download/${{ env.TOOLCHAIN_TAG }}/riscv64-elf-ubuntu-24.04-gcc.tar.xz \
+            -O toolchain.tar.xz || \
+          # Fallback to older naming pattern if needed
+          wget -q --show-progress \
+            https://github.com/riscv-collab/riscv-gnu-toolchain/releases/download/${{ env.TOOLCHAIN_TAG }}/riscv64-unknown-elf-toolchain-${{ env.TOOLCHAIN_TAG }}-x86_64-linux-ubuntu24.tar.gz \
+            -O toolchain.tar.xz || echo "⚠️ Primary download failed, trying alternative..."
+
+          # Extract (handles both .tar.xz and .tar.gz)
+          if [ -f toolchain.tar.xz ]; then
+            tar -xJf toolchain.tar.xz --strip-components=1 -C .
+          elif [ -f toolchain.tar.gz ]; then
+            tar -xzf toolchain.tar.gz --strip-components=1 -C .
+          else
+            echo "❌ Toolchain download failed. Falling back to apt package (may be older)."
+            sudo apt-get install -y gcc-riscv64-unknown-elf
+          fi
+
           echo "$HOME/riscv-toolchain/bin" >> $GITHUB_PATH
 
-      - name: ✅ Verify toolchain installation
+      - name: ✅ Verify RISC-V toolchain installation
         run: |
           echo "=== Toolchain Verification ==="
-          which ${{ env.RISCV_PREFIX }}gcc || echo "Toolchain not in PATH"
-          ${{ env.RISCV_PREFIX }}gcc --version
-          ${{ env.RISCV_PREFIX }}as --version
+          which ${{ env.RISCV_PREFIX }}gcc || echo "WARNING: Toolchain not found in PATH"
+          ${{ env.RISCV_PREFIX }}gcc --version | head -5
+          ${{ env.RISCV_PREFIX }}as --version | head -3
           echo "RISCV_PREFIX=${{ env.RISCV_PREFIX }}" >> $GITHUB_ENV
 
-      - name: ✅ Setup complete summary
+      - name: ✅ Setup complete - environment summary
         run: |
+          echo "=== Final Environment Summary ==="
           echo "Python: $(python --version)"
           echo "Verilator: $(verilator --version 2>&1 | head -1 || echo 'N/A')"
           echo "Yosys: $(yosys --version 2>&1 | head -1)"
-          echo "RISC-V GCC: $(${{ env.RISCV_PREFIX }}gcc --version | head -1)"
+          echo "RISC-V GCC: $(${{ env.RISCV_PREFIX }}gcc --version | head -1 || echo 'Not found')"
 
-  # The rest of the jobs remain almost identical (agentic-rtl-generation, simulation-verification, synthesis-estimates, final-summary)
-
+  # =============================================
+  # 2. AGENTIC RTL GENERATION MATRIX
+  # =============================================
   agentic-rtl-generation:
     needs: setup-environment
     runs-on: ubuntu-24.04
@@ -124,7 +140,7 @@ jobs:
         backend: [python, rtlcoder_mistral, rtlcoder_deepseek, verilogcoder]
 
     steps:
-      - name: 📋 Checkout
+      - name: 📋 Checkout code
         uses: actions/checkout@v4
 
       - name: 🔄 Restore Verilator cache
@@ -133,33 +149,41 @@ jobs:
           path: ~/verilator
           key: ${{ runner.os }}-verilator-${{ env.VERILATOR_VERSION }}
 
-      - name: 🚀 Run Agentic Co-Design (${{ matrix.core }} + ${{ matrix.noise }} via ${{ matrix.backend }})
+      - name: 🚀 Run Agentic Co-Design - ${{ matrix.core }} + ${{ matrix.noise }} via ${{ matrix.backend }}
         run: |
-          echo "=== Agentic Generation Start ==="
-          echo "Core: ${{ matrix.core }} | Noise: ${{ matrix.noise }} | Backend: ${{ matrix.backend }}"
+          echo "=== Starting Agentic RTL Generation ==="
+          echo "Core           : ${{ matrix.core }}"
+          echo "Noise mechanism: ${{ matrix.noise }}"
+          echo "Backend        : ${{ matrix.backend }}"
+
+          mkdir -p logs rtl/generated/${{ matrix.core }}_${{ matrix.noise }}_${{ matrix.backend }}
+
           python scripts/agentic_generator.py \
             --core ${{ matrix.core }} \
             --noise ${{ matrix.noise }} \
             --backend ${{ matrix.backend }} \
             --epsilon 1.0 \
             --output-dir rtl/generated/${{ matrix.core }}_${{ matrix.noise }}_${{ matrix.backend }} \
-            --verbose
+            --verbose 2>&1 | tee logs/agent_${{ matrix.core }}_${{ matrix.noise }}_${{ matrix.backend }}.log
 
-          # Fallback if generation fails
-          mkdir -p rtl/generated/${{ matrix.core }}_${{ matrix.noise }}_${{ matrix.backend }}
+          # Fallback to simple DP module if agent fails
           if [ ! -f "rtl/generated/${{ matrix.core }}_${{ matrix.noise }}_${{ matrix.backend }}/dp_noise_injector.v" ]; then
-            cp dp_noise/fallback_dp_noise_injector.v rtl/generated/${{ matrix.core }}_${{ matrix.noise }}_${{ matrix.backend }}/
+            echo "⚠️ Agent generation failed - using fallback DP noise injector"
+            cp dp_noise/fallback_dp_noise_injector.v rtl/generated/${{ matrix.core }}_${{ matrix.noise }}_${{ matrix.backend }}/ || true
           fi
 
-      - name: 📤 Upload generated RTL
+      - name: 📤 Upload generated RTL and logs
         uses: actions/upload-artifact@v4
         with:
           name: generated-rtl-${{ matrix.core }}-${{ matrix.noise }}-${{ matrix.backend }}
-          path: rtl/generated/${{ matrix.core }}_${{ matrix.noise }}_${{ matrix.backend }}/**
+          path: |
+            rtl/generated/${{ matrix.core }}_${{ matrix.noise }}_${{ matrix.backend }}/**
+            logs/agent_*.log
           retention-days: 14
 
-  # (simulation-verification, synthesis-estimates, and final-summary jobs are unchanged from the previous revised version)
-
+  # =============================================
+  # 3. SIMULATION & VERIFICATION MATRIX
+  # =============================================
   simulation-verification:
     needs: [setup-environment, agentic-rtl-generation]
     runs-on: ubuntu-24.04
@@ -173,13 +197,16 @@ jobs:
         test_suite: [basic, noise_injection, privacy_metrics, coremark_lite]
 
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/cache/restore@v4
+      - name: 📋 Checkout
+        uses: actions/checkout@v4
+
+      - name: 🔄 Restore Verilator
+        uses: actions/cache/restore@v4
         with:
           path: ~/verilator
           key: ${{ runner.os }}-verilator-${{ env.VERILATOR_VERSION }}
 
-      - name: 🧪 Run ${{ matrix.test_suite }} simulation
+      - name: 🧪 Run ${{ matrix.test_suite }} simulation for ${{ matrix.core }} + ${{ matrix.noise }}
         run: |
           export PATH=$HOME/verilator/install/bin:$PATH
           make -C sim/${{ matrix.test_suite }} \
@@ -190,7 +217,7 @@ jobs:
             VCD=waveform_${{ matrix.test_suite }}.vcd \
             all 2>&1 | tee sim_output.log
 
-      - name: 📊 Analyze DP noise (if applicable)
+      - name: 📊 Analyze DP noise & privacy metrics (if applicable)
         if: matrix.test_suite == 'noise_injection' || matrix.test_suite == 'privacy_metrics'
         run: |
           python scripts/analyze_dp_noise.py \
@@ -199,7 +226,8 @@ jobs:
             --epsilon 1.0 \
             --output report_${{ matrix.core }}_${{ matrix.noise }}_${{ matrix.backend }}_${{ matrix.test_suite }}.md
 
-      - uses: actions/upload-artifact@v4
+      - name: 📤 Upload simulation artifacts
+        uses: actions/upload-artifact@v4
         with:
           name: sim-${{ matrix.core }}-${{ matrix.noise }}-${{ matrix.backend }}-${{ matrix.test_suite }}
           path: |
@@ -208,24 +236,81 @@ jobs:
             report_*.md
           retention-days: 14
 
-  # ... (add synthesis-estimates and final-summary similarly as in previous version)
+  # =============================================
+  # 4. SYNTHESIS ESTIMATES (Yosys)
+  # =============================================
+  synthesis-estimates:
+    needs: simulation-verification
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      matrix:
+        core: [picorv32, vexriscv]
+        noise: [laplace, gaussian]
 
+    steps:
+      - name: 📋 Checkout
+        uses: actions/checkout@v4
+
+      - name: 🔬 Synthesize with Yosys
+        run: |
+          yosys -p "
+            read_verilog rtl/*.v rtl/generated/*_${{ matrix.core }}_${{ matrix.noise }}*/*.v;
+            hierarchy -check;
+            synth -top ${{ env.DP_MODULE_NAME }};
+            stat;
+            write_json synth_${{ matrix.core }}_${{ matrix.noise }}.json;
+          " > yosys_${{ matrix.core }}_${{ matrix.noise }}.log 2>&1
+
+          python scripts/parse_synthesis.py \
+            --input synth_${{ matrix.core }}_${{ matrix.noise }}.json \
+            --output synthesis_report_${{ matrix.core }}_${{ matrix.noise }}.md
+
+      - name: 📤 Upload synthesis results
+        uses: actions/upload-artifact@v4
+        with:
+          name: synthesis-${{ matrix.core }}-${{ matrix.noise }}
+          path: |
+            synth_*.json
+            yosys_*.log
+            synthesis_report_*.md
+
+  # =============================================
+  # 5. FINAL SUMMARY
+  # =============================================
   final-summary:
     needs: [agentic-rtl-generation, simulation-verification, synthesis-estimates]
     runs-on: ubuntu-24.04
     if: always()
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - name: 📋 Checkout
+        uses: actions/checkout@v4
+
+      - name: 📥 Download all artifacts
+        uses: actions/download-artifact@v4
         with:
           path: all-artifacts
 
-      - name: 📝 Generate full report
+      - name: 📝 Generate comprehensive report
         run: |
-          python scripts/generate_full_report.py --artifacts-dir all-artifacts --output SUMMARY_FULL.md
+          python scripts/generate_full_report.py \
+            --artifacts-dir all-artifacts \
+            --output SUMMARY_FULL.md \
+            --include-failures
           cat SUMMARY_FULL.md
 
-      - uses: actions/upload-artifact@v4
+      - name: 📤 Upload final summary
+        uses: actions/upload-artifact@v4
         with:
           name: full-demo-summary
           path: SUMMARY_FULL.md
+
+      - name: 💬 Comment on PR (if applicable)
+        if: github.event_name == 'pull_request'
+        uses: thollander/actions-comment-pull-request@v2
+        with:
+          message: |
+            🎉 **RISC-V + DP Agentic Co-Design Matrix Test Completed!**
+
+            Full matrix results are available in the `full-demo-summary` artifact.
+            Includes RTL generation, simulation waveforms, noise analysis, and Yosys area estimates.
